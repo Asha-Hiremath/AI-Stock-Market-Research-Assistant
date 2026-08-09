@@ -1,0 +1,37 @@
+# Databricks App Configuration for Stock Research Assistant
+
+command:
+  - streamlit
+  - run
+  - app.py
+  - --server.port=8080
+  - --server.address=0.0.0.0
+
+env:
+  - name: DATABRICKS_HOST
+    valueFrom: .host
+  - name: DATABRICKS_TOKEN
+    valueFrom: .token
+  - name: DATABRICKS_SERVER_HOSTNAME
+    value: "{{ secrets.database.lakebase-url }}"
+  - name: DATABRICKS_HTTP_PATH
+    value: "/sql/1.0/warehouses/{{ compute.warehouse_id }}"
+
+resources:
+  - name: database
+    description: "Alpaca and Lakebase credentials"
+    secret:
+      scope: database
+      key: alpaca-key-id
+      prefix: ALPACA
+  - name: database
+    secret:
+      scope: database
+      key: alpaca-secret-key
+      prefix: ALPACA
+  - name: massive
+    description: "Massive.com API key"
+    secret:
+      scope: massive
+      key: api-key
+      prefix: MASSIVE
