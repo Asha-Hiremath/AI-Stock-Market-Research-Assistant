@@ -12,10 +12,14 @@ env:
     valueFrom: .host
   - name: DATABRICKS_TOKEN
     valueFrom: .token
+  # For Databricks SQL connector (Unity Catalog queries)
   - name: DATABRICKS_SERVER_HOSTNAME
-    value: "{{ secrets.database.lakebase-url }}"
+    valueFrom: .host  # Use workspace hostname, NOT Lakebase URL
   - name: DATABRICKS_HTTP_PATH
     value: "/sql/1.0/warehouses/{{ compute.warehouse_id }}"
+  # For Lakebase connection (separate from SQL connector)
+  - name: LAKEBASE_URL
+    value: "{{ secrets.database.lakebase-url }}"
 
 resources:
   - name: database

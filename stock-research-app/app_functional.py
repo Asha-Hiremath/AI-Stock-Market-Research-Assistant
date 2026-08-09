@@ -51,6 +51,35 @@ news_client = NewsClient(secrets["alpaca_key"], secrets["alpaca_secret"])
 quote_client = StockHistoricalDataClient(secrets["alpaca_key"], secrets["alpaca_secret"])
 
 # Initialize embedding model
+# Retry decorator with exponential backoff
+def retry_with_backoff(max_retries=3, base_delay=1.0, max_delay=10.0):
+    """Decorator to retry functions with exponential backoff"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            retries = 0
+            delay = base_delay
+            
+            while retries < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    retries += 1
+                    if retries >= max_retries:
+                        raise  # Re-raise the exception on final failure
+                    
+                    # Log retry attempt
+                    error_name = type(e).__name__
+                    print(f"Retry {retries}/{max_retries} for {func.__name__} after {error_name}: {str(e)[:100]}")
+                    
+                    # Exponential backoff with jitter
+                    sleep_time = min(delay * (2 ** (retries - 1)), max_delay)
+                    time.sleep(sleep_time)
+            
+            return None
+        return wrapper
+    return decorator
+
 @st.cache_resource
 def get_embedding_model():
     return SentenceTransformer('all-MiniLM-L6-v2')
@@ -63,7 +92,10 @@ user_email = w.current_user.me().user_name
 # Helper: Lakebase connection
 def get_lakebase_connection():
     """Create connection to Lakebase Postgres"""
-    conn_str = secrets["lakebase_url"]
+    # Use environment variable set by app.yaml (correct for Apps deployment)
+    conn_str = os.getenv("LAKEBASE_URL") or secrets.get("lakebase_url")
+    if not conn_str:
+        raise ValueError("LAKEBASE_URL not configured")
     return psycopg2.connect(conn_str)
 
 # Helper: Query Unity Catalog
@@ -150,50 +182,60 @@ def get_watchlist():
 
 # Semantic search function
 def semantic_search(query_text, limit=10):
-    """Perform semantic search using embeddings"""
+    """Perform semantic search using pgvector in Lakebase"""
     try:
         # Generate query embedding
         query_embedding = embedding_model.encode(query_text).tolist()
         
-        # Query Unity Catalog for similar articles
-        # Using cosine similarity via array_dot / array_norm
-        df = query_uc(f"""
-            WITH similarities AS (
-                SELECT 
-                    id,
-                    ticker,
-                    headline,
-                    summary,
-                    url,
-                    created_at,
-                    -- Cosine similarity
-                    AGGREGATE(
-                        TRANSFORM(embedding, x -> x * {query_embedding[0]})
-                    ) / (
-                        SQRT(AGGREGATE(TRANSFORM(embedding, x -> x * x))) *
-                        SQRT({np.dot(query_embedding, query_embedding)})
-                    ) AS similarity
-                FROM main.stock_news.ticker_news_embeddings
-            )
-            SELECT *
-            FROM similarities
-            WHERE similarity > 0.5
-            ORDER BY similarity DESC
-            LIMIT {limit}
-        """)
+        # Convert to pgvector format
+        vector_str = '[' + ','.join(map(str, query_embedding)) + ']'
         
-        return df
+        # Query Lakebase pgvector for similar articles using cosine distance operator
+        conn = get_lakebase_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT 
+                id,
+                ticker,
+                headline,
+                summary,
+                url,
+                created_at,
+                1 - (embedding <=> %s::vector) as similarity
+            FROM ticker_news_embeddings
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        """, (vector_str, vector_str, limit))
+        
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        # Convert to pandas DataFrame
+        if results:
+            df = pd.DataFrame(results, columns=[
+                'id', 'ticker', 'headline', 'summary', 'url', 'created_at', 'similarity'
+            ])
+            return df
+        else:
+            return pd.DataFrame()
+        
     except Exception as e:
         st.error(f"Semantic search error: {e}")
-        # Fallback to keyword search
-        return query_uc(f"""
-            SELECT id, ticker, headline, summary, url, created_at
-            FROM main.stock_news.ticker_news_raw
-            WHERE LOWER(headline) LIKE LOWER('%{query_text}%')
-               OR LOWER(summary) LIKE LOWER('%{query_text}%')
-            ORDER BY created_at DESC
-            LIMIT {limit}
-        """)
+        st.info("Falling back to keyword search...")
+        # Fallback to keyword search in Unity Catalog
+        try:
+            return query_uc(f"""
+                SELECT id, ticker, headline, summary, url, created_at
+                FROM main.stock_news.ticker_news_raw
+                WHERE LOWER(headline) LIKE LOWER('%{query_text}%')
+                   OR LOWER(summary) LIKE LOWER('%{query_text}%')
+                ORDER BY created_at DESC
+                LIMIT {limit}
+            """)
+        except:
+            return pd.DataFrame()
 
 # Sidebar navigation
 st.sidebar.title("📈 Stock Research")
@@ -478,6 +520,77 @@ elif page == "Trade":
                 st.warning("Please check your account balance, ticker symbol, and market hours.")
         else:
             st.warning("Please enter ticker and quantity")
+
+# ========== HEALTH CHECK PAGE ==========
+elif page == "Health Check":
+    st.header("🔍 System Health Check")
+    st.write("Verify all integrations are configured correctly.")
+    
+    # Check 1: Databricks SQL / Unity Catalog
+    st.subheader("1️⃣ Unity Catalog Connection")
+    try:
+        test_df = query_uc("SELECT current_catalog() as catalog, current_schema() as schema, current_timestamp() as timestamp")
+        st.success("✓ Unity Catalog connected")
+        st.dataframe(test_df)
+    except Exception as e:
+        st.error(f"❌ Unity Catalog failed: {e}")
+    
+    # Check 2: Lakebase Postgres
+    st.subheader("2️⃣ Lakebase Postgres Connection")
+    try:
+        conn = get_lakebase_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT version(), current_timestamp")
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        st.success("✓ Lakebase connected")
+        st.text(f"Version: {result[0][:50]}...")
+        st.text(f"Timestamp: {result[1]}")
+    except Exception as e:
+        st.error(f"❌ Lakebase failed: {e}")
+    
+    # Check 3: Alpaca API
+    st.subheader("3️⃣ Alpaca Trading API")
+    try:
+        account = trading_client.get_account()
+        st.success("✓ Alpaca connected")
+        st.json({
+            "Account Status": account.status,
+            "Buying Power": f"${float(account.buying_power):,.2f}",
+            "Cash": f"${float(account.cash):,.2f}",
+            "Portfolio Value": f"${float(account.portfolio_value):,.2f}"
+        })
+    except Exception as e:
+        st.error(f"❌ Alpaca failed: {e}")
+    
+    # Check 4: Quote Data
+    st.subheader("4️⃣ Market Quote Data")
+    try:
+        request_params = StockLatestQuoteRequest(symbol_or_symbols="AAPL")
+        quote = quote_client.get_stock_latest_quote(request_params)["AAPL"]
+        st.success("✓ Quote data available")
+        st.json({
+            "Symbol": "AAPL",
+            "Bid": float(quote.bid_price),
+            "Ask": float(quote.ask_price),
+            "Timestamp": str(quote.timestamp)
+        })
+    except Exception as e:
+        st.error(f"❌ Quote data failed: {e}")
+    
+    # Check 5: Embedding model
+    st.subheader("5️⃣ Embedding Model")
+    try:
+        test_embedding = embedding_model.encode("test query")
+        st.success("✓ Embedding model loaded")
+        st.text(f"Model: {embedding_model}")
+        st.text(f"Embedding dimension: {len(test_embedding)}")
+    except Exception as e:
+        st.error(f"❌ Embedding model failed: {e}")
+    
+    st.divider()
+    st.info("💡 **Tip:** All checks should pass. If any fail, verify your app.yaml configuration and secret scope settings.")
 
 # Footer
 st.divider()
