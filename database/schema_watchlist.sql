@@ -11,6 +11,6 @@ CREATE TABLE IF NOT EXISTS watchlist (
 );
 
 -- Create indexes for better query performance
-CREATE INDEX IF NOT EXISTS idx_watchlist_user_id ON watchlist(user_id);
+CREATE INDEX IF NOT EXISTS idx_watchlist_email ON watchlist(email);
 CREATE INDEX IF NOT EXISTS idx_watchlist_symbol ON watchlist(symbol);
-CREATE INDEX IF NOT EXISTS idx_watchlist_added_at ON watchlist(added_at DESC);
+CREATE INDEX IF NOT EXISTS idx_watchlist_updated_at ON watchlist(updated_at DESC);
